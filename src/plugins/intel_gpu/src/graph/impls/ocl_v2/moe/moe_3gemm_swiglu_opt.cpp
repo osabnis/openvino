@@ -1182,15 +1182,20 @@ public:
 
     // Weights without a batched GEMV OCL kernel decode through OneDNN grouped GEMM instead
     static MoeGemmImpl select_decode_impl(const RuntimeParams& params, data_types weight_dt) {
+        // Only the grouped GEMM applies zero points after the scales
+        if (params.typed_desc<moe_3gemm_fused_compressed>()->decompression_zero_point_after_scale) {
+            return MoeGemmImpl::grouped_gemm;
+        }
         if (MoE3GemmInt3Gemv::is_supported(params)) {
             return MoeGemmImpl::int3_batched_gemv;
         }
         return is_batched_gemv_supported(weight_dt) ? MoeGemmImpl::batched_gemv : MoeGemmImpl::grouped_gemm;
     }
 
-    static MoeGemmImpl select_prefill_impl(const ExecutionConfig& config, data_types weight_dt, gpu_arch arch) {
-        // No GEMV-based prefill for this weight type (u3): prefill goes through OneDNN grouped GEMM
-        if (!is_batched_gemv_supported(weight_dt) || config.get_moe_use_grouped_gemm_prefill()) {
+    static MoeGemmImpl select_prefill_impl(const ExecutionConfig& config, data_types weight_dt, gpu_arch arch, bool zero_point_after_scale) {
+        // No GEMV-based prefill for this weight type (u3), or zero points applied after the scales: prefill goes through
+        // OneDNN grouped GEMM
+        if (!is_batched_gemv_supported(weight_dt) || zero_point_after_scale || config.get_moe_use_grouped_gemm_prefill()) {
             return MoeGemmImpl::grouped_gemm;
         }
         // micro_gemm is better than the per-expert onednn loop. Remove the weight limitation once it supports i8/u8.
@@ -1214,7 +1219,10 @@ public:
 
         const auto& weight_dt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0)).data_type;
         decode_impl = select_decode_impl(params, weight_dt);
-        prefill_impl = select_prefill_impl(config, weight_dt, params.prog->get_engine().get_device_info().arch);
+        prefill_impl = select_prefill_impl(config,
+                                           weight_dt,
+                                           params.prog->get_engine().get_device_info().arch,
+                                           params.typed_desc<moe_3gemm_fused_compressed>()->decompression_zero_point_after_scale);
         // The micro-GEMM reads the scales and zero points of every expert, not of the expert slots
         if (prefill_impl == MoeGemmImpl::micro_gemm && node.as<moe_3gemm_fused_compressed>().get_primitive()->_otd.lru_expert_num > 0) {
             prefill_impl = MoeGemmImpl::per_expert_onednn;
@@ -2575,11 +2583,15 @@ public:
 
             bool has_k_groups = (group_size < K);
             const bool zp_host_scalar = static_cast<bool>(_grouped_zp_host_scalars[gemm_idx]);
+            // prepare_quantization stored zp * scale in the floating-point zero points
+            const auto qmode = has_zp && cur_moe->decompression_zero_point_after_scale && zp_dts[gemm_idx] == dnnl::memory::data_type::f16
+                                   ? dnnl::quantization_mode::static_sbzp
+                                   : dnnl::quantization_mode::static_sazp;
             if (has_k_groups) {
                 // per-expert(0) x per-K-group(1) x per-N-channel(2)
-                attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1) | (1 << 2), {group_size, 1}, dnnl::memory::data_type::f16);
+                attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1) | (1 << 2), {group_size, 1}, dnnl::memory::data_type::f16, false, qmode);
                 if (has_zp && !zp_host_scalar) {
-                    attr.set_zero_points(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1) | (1 << 2), {group_size, 1}, zp_dts[gemm_idx]);
+                    attr.set_zero_points(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1) | (1 << 2), {group_size, 1}, zp_dts[gemm_idx], false, qmode);
                 }
             } else {
                 // per-expert(0) x per-N-channel(2), no K-grouping

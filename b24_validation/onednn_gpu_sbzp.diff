@@ -1,0 +1,48 @@
+diff --git a/src/gpu/intel/matmul/grouped_micro_gemm.cpp b/src/gpu/intel/matmul/grouped_micro_gemm.cpp
+index d9bbc197b..42c8a5412 100644
+--- a/src/gpu/intel/matmul/grouped_micro_gemm.cpp
++++ b/src/gpu/intel/matmul/grouped_micro_gemm.cpp
+@@ -188,6 +188,8 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(
+                                   ? 1
+                                   : 2);
+         problem.aOffset = ABOffset::Calc;
++        problem.aOffsetAfterScale
++                = attr()->zero_points_.get(DNNL_ARG_WEIGHTS).is_sbzp();
+     }
+ 
+     if (opts.scaleB) {
+@@ -592,6 +594,18 @@ status_t grouped_micro_gemm_t::pd_t::init_m_axis(const impl::engine_t *engine) {
+                     VERBOSE_UNSUPPORTED_ZP_CFG
+                     ": host scalar wei zero points dt(%s)",
+                     dnnl_dt2str(wei_quant_.zp_dt()));
++        } else if (attr()->zero_points_.get(DNNL_ARG_WEIGHTS).is_sbzp()) {
++            // static_sbzp (data types checked by the common layer): weights
++            // decompression applying the zero points after the scales, which
++            // needs both in the microkernel, as 2D parameters.
++            VDISPATCH_MATMUL(utils::one_of(src_dt, f16, bf16),
++                    VERBOSE_UNSUPPORTED_ZP_CFG
++                    ": static_sbzp wei zero points with src dt(%s)",
++                    dnnl_dt2str(src_dt));
++            VDISPATCH_MATMUL(wei_zp_mask == 7,
++                    VERBOSE_UNSUPPORTED_ZP_CFG
++                    ": static_sbzp wei zero points mask(%d)",
++                    wei_zp_mask);
+         } else if (wei_zp_mask == 5) {
+             VDISPATCH_MATMUL(
+                     utils::one_of(wei_quant_.zp_dt(), s32, u8, s8, u4, s4),
+@@ -627,6 +641,15 @@ status_t grouped_micro_gemm_t::pd_t::init_m_axis(const impl::engine_t *engine) {
+         calc_group_sizes(wei_group_sizes_,
+                 attr()->zero_points_.get(DNNL_ARG_WEIGHTS), wei_d);
+     }
++    // Scales with a single group along K are applied after the GEMM.
++    VDISPATCH_MATMUL(
++            IMPLICATION(wei_quant_.with_zp()
++                            && attr()->zero_points_.get(DNNL_ARG_WEIGHTS)
++                                       .is_sbzp(),
++                    wei_group_sizes_[1] < K()),
++            VERBOSE_UNSUPPORTED_ZP_CFG
++            ": static_sbzp wei k group (%d) must be smaller than K",
++            wei_group_sizes_[1]);
+ 
+     return status::success;
+ }

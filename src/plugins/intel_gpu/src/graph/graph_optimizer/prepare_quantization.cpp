@@ -837,9 +837,83 @@ static void optimize_moe_gemm_decompression_parameters(moe_gemm_node& node, prog
     }
 }
 
+// Floating-point zero points of the routed experts use oneDNN's static_sbzp in the grouped GEMM, as for FC: store
+// zp * scale and flag the primitive. Integer zero points are kept; their GEMMs stay in static_sazp.
+static void use_zero_point_after_scale(moe_node& node, program& p) {
+#ifdef ENABLE_ONEDNN_FOR_GPU
+    using ov::intel_gpu::ocl::MOE3GemmInputIndex;
+    auto prim = node.get_primitive();
+    if (!prim->_config.has_zp || prim->decompression_zero_point_after_scale)
+        return;
+
+    const auto& info = p.get_engine().get_device_info();
+    if (!info.supports_immad || info.arch == gpu_arch::unknown || !p.get_config().get_use_onednn())
+        return;
+    // static_sbzp needs f16 / bf16 activations; the fused MoE takes f16 only
+    if (node.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES)).data_type != data_types::f16)
+        return;
+
+    constexpr std::array<std::pair<MOE3GemmInputIndex, MOE3GemmInputIndex>, 3> routed{{
+        {MOE3GemmInputIndex::SCALE_0, MOE3GemmInputIndex::ZP_0},
+        {MOE3GemmInputIndex::SCALE_1, MOE3GemmInputIndex::ZP_1},
+        {MOE3GemmInputIndex::SCALE_2, MOE3GemmInputIndex::ZP_2},
+    }};
+    // Check all three GEMMs before changing any, so the zero points are either all stored as zp * scale or none is
+    std::vector<std::pair<size_t, size_t>> to_scale;
+    for (const auto& [scale_i, zp_i] : routed) {
+        const auto scale_idx = static_cast<size_t>(scale_i);
+        const auto zp_idx = static_cast<size_t>(zp_i);
+        auto& scale_node = node.get_dependency(scale_idx);
+        auto& zp_node = node.get_dependency(zp_idx);
+        if (zp_node.get_output_layout().data_type != data_types::f16)
+            continue;
+        if (!zp_node.is_type<data>() || !scale_node.is_type<data>())
+            return;
+        const auto& scale_layout = scale_node.get_output_layout();
+        const auto& zp_layout = zp_node.get_output_layout();
+        if (scale_layout.data_type != data_types::f16 || scale_layout.is_dynamic() || zp_layout.get_partial_shape() != scale_layout.get_partial_shape() ||
+            zp_layout.format != scale_layout.format || scale_layout.data_padding || zp_layout.data_padding)
+            return;
+        // [num_experts, N, groups(, 1)]: static_sbzp needs at least two groups along K
+        const auto& shape = scale_layout.get_shape();
+        if (shape.size() < 3 || shape[2] < 2)
+            return;
+        to_scale.emplace_back(scale_idx, zp_idx);
+    }
+    if (to_scale.empty())
+        return;
+
+    auto& stream = p.get_stream();
+    for (const auto& [scale_idx, zp_idx] : to_scale) {
+        auto& zp_node = node.get_dependency(zp_idx);
+        auto scale_mem = node.get_dependency(scale_idx).as<data>().get_attached_memory_ptr();
+        auto zp_mem = zp_node.as<data>().get_attached_memory_ptr();
+        auto zp_after_scale_mem = p.get_engine().allocate_memory(zp_node.get_output_layout(), false);
+        {
+            // scale and zero point have the same shape and layout, so the product is element-wise
+            mem_lock<ov::float16, mem_lock_type::read> scale_lock{scale_mem, stream};
+            mem_lock<ov::float16, mem_lock_type::read> zp_lock{zp_mem, stream};
+            mem_lock<ov::float16, mem_lock_type::write> out_lock{zp_after_scale_mem, stream};
+            for (size_t i = 0; i < out_lock.size(); i++)
+                out_lock[i] = ov::float16(static_cast<float>(zp_lock[i]) * static_cast<float>(scale_lock[i]));
+        }
+        auto zp_after_scale_prim = std::make_shared<data>(zp_node.id() + "_after_scale_" + node.id(), zp_after_scale_mem);
+        auto& zp_after_scale_node = p.get_or_create(zp_after_scale_prim);
+        p.get_inputs().push_back(&zp_after_scale_node);
+        p.get_processing_order().insert(&node, &zp_after_scale_node);
+        node.replace_dependency(zp_idx, zp_after_scale_node);  // removes the old zero point if it has no other user
+    }
+    std::const_pointer_cast<moe_3gemm_fused_compressed>(prim)->decompression_zero_point_after_scale = true;
+#endif  // ENABLE_ONEDNN_FOR_GPU
+}
+
 static void optimize_moe_3gemm_fused_decompression_parameters(moe_node& node, program& p) {
     using ov::intel_gpu::ocl::MOE3GemmInputIndex;
     auto prim = node.get_primitive();
+    // OTD routed weights are backed by resident-size allocations; a new zero point would materialize full logical tensors
+    if (prim->_otd.lru_expert_num == 0) {
+        use_zero_point_after_scale(node, p);
+    }
     const auto& cfg = prim->_config;
     // Routed-expert scales (gate/up/down); zp at +1 when has_zp.
     constexpr std::array<size_t, 3> routed_scale_indices{

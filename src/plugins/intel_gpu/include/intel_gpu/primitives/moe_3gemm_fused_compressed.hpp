@@ -144,6 +144,16 @@ struct moe_3gemm_fused_compressed : public primitive_base<moe_3gemm_fused_compre
 
     MOECompressed::Config _config;
     moe_otd_descriptor _otd;
+    /// @brief Floating-point zero points are subtracted after scaling (w = scale * q - zp) instead of before
+    /// (w = scale * (q - zp)). Set by prepare_quantization for oneDNN's static_sbzp mode, which then holds zp * scale in
+    /// those zero point inputs; integer zero points are not affected.
+    bool decompression_zero_point_after_scale = false;
+
+    size_t hash() const override {
+        size_t seed = primitive::hash();
+        seed = hash_combine(seed, decompression_zero_point_after_scale);
+        return seed;
+    }
 
     bool operator==(const primitive& rhs) const override {
         if (!compare_common_params(rhs)) {
@@ -152,19 +162,22 @@ struct moe_3gemm_fused_compressed : public primitive_base<moe_3gemm_fused_compre
 
         auto rhs_casted = downcast<const moe_3gemm_fused_compressed>(rhs);
 
-        return std::memcmp(&_config, &rhs_casted._config, sizeof(_config)) == 0 && _otd == rhs_casted._otd;
+        return std::memcmp(&_config, &rhs_casted._config, sizeof(_config)) == 0 && _otd == rhs_casted._otd &&
+               decompression_zero_point_after_scale == rhs_casted.decompression_zero_point_after_scale;
     }
 
     void save(BinaryOutputBuffer& ob) const override {
         primitive_base<moe_3gemm_fused_compressed>::save(ob);
         ob << make_data(&_config, sizeof(_config));
         _otd.save(ob);
+        ob << decompression_zero_point_after_scale;
     }
 
     void load(BinaryInputBuffer& ib) override {
         primitive_base<moe_3gemm_fused_compressed>::load(ib);
         ib >> make_data(&_config, sizeof(_config));
         _otd.load(ib);
+        ib >> decompression_zero_point_after_scale;
     }
 };
 

@@ -298,6 +298,11 @@ event::ptr primitive_inst::set_output_memory(memory::ptr mem_new, bool check, si
     if (is_constant()) {
         ev = mem_new->copy_from(get_network().get_stream(), *_outputs[idx], false);
     } else {
+        // A pool buffer replaced by other memory is no longer used here. Return it, or the next realloc_outputs()
+        // releases the new memory instead and the pool keeps the buffer for good.
+        if (idx == 0 && is_dynamic()) {
+            release_and_clear_output_memory();
+        }
         _outputs[idx] = mem_new;
         _max_output_layout_count[idx] = mem_new->get_layout().get_linear_size();
         // Refresh dynamic arguments during preparation even if the input shape is unchanged.

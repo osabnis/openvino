@@ -577,9 +577,9 @@ std::vector<primitive_inst*> network::build_output_chain(std::shared_ptr<primiti
             add_mdata_chain(nc_cand);
         }
 
-        // A runtime-skippable permute may need to execute after its concrete shape is known.
-        // Keep a remote output bound to the permute without aliasing its input producer.
-        if (is_remote && cand->get_node().is_type<permute>() && cand->get_node().is_runtime_skippable()) {
+        // A runtime-skippable node behind the output (permute, scatter_update, ...) may need to execute after its concrete
+        // shape is known. Keep a remote output bound to the node without aliasing its input producer.
+        if (is_remote && cand != p_inst.get() && cand->get_node().is_runtime_skippable()) {
             continue;
         }
 
@@ -625,7 +625,7 @@ std::vector<event::ptr> network::set_output_memory(const primitive_id& id, memor
 
     auto& eng = get_engine();
     // Remote outputs need a conservative chain because a runtime-skippable
-    // permute may become executable after shape inference.
+    // node may become executable after shape inference.
     // Build before invalidation: the chain is filtered by the output's current buffer.
     auto& output_chains = is_remote ? _remote_output_chains : _output_chains;
     auto o_iter = output_chains.find(id);

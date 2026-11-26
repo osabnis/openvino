@@ -85,6 +85,15 @@ struct moe_3gemm_swiglu_opt : public ImplementationManager {
             }
             if (config.has_zp) {
                 const auto zp_dt = dt_of(zps[i]);
+                // A floating-point zero point holds zp * scale (prepare_quantization): the OneDNN grouped GEMM applies it
+                // after the scales (static_sbzp)
+                if (zp_dt == ov::element::f16) {
+                    const auto prim = std::static_pointer_cast<const moe_3gemm_fused_compressed>(node.get_primitive());
+                    if (!prim->decompression_zero_point_after_scale || wei_dt == ov::element::u3) {
+                        return false;
+                    }
+                    continue;
+                }
                 // The batched GEMV strides zp by the weight's bit width (MOE_EXPERT_ZP_BYTES), so they must match.
                 // u3 never runs it (OneDNN grouped GEMM) and its zp is u8, so it is exempt.
                 const bool zp_width_ok = wei_dt == ov::element::u3 || zp_dt.bitwidth() == wei_dt.bitwidth();
